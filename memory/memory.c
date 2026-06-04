@@ -1,111 +1,158 @@
 #include "memory.h"
 
 /* ============================================================
-   platform page allocator
+   INTERNAL CONFIG
    ============================================================ */
+#define SMALL_ALLOC_LIMIT 4096
+#define ARENA_CAP         (1024 * 1024)
 
-#if defined(__linux__) && defined(__x86_64__)
+#ifndef PAGE_SIZE
+#define PAGE_SIZE 4096
+#endif
 
-/* mmap syscall: nr=9, munmap: nr=11 */
-void *sc_page_alloc(usize size) {
-    usize sz = align_up(size, 4096);
+/* ============================================================
+   RAW SYSCALLS (x86-64 Linux)
+   mmap  = syscall 9
+   munmap = syscall 11
+   ============================================================ */
+#define PROT_READ_WRITE  0x3          /* PROT_READ | PROT_WRITE */
+#define MAP_PRIVATE_ANON 0x22         /* MAP_PRIVATE | MAP_ANONYMOUS */
+#define MAP_FAILED_VAL   ((void *)-1)
+
+static void *sc_mmap(usize size) {
     void *ret;
-    register long r10 __asm__("r10") = 0x22; /* MAP_PRIVATE|MAP_ANONYMOUS */
-    register long r8  __asm__("r8")  = -1;
-    register long r9  __asm__("r9")  = 0;
+    register long r10 __asm__("r10") = MAP_PRIVATE_ANON;
+    register long r8  __asm__("r8")  = -1;  /* fd */
+    register long r9  __asm__("r9")  =  0;  /* offset */
     __asm__ volatile (
         "syscall"
         : "=a"(ret)
-        : "0"(9), "D"((void*)0), "S"(sz), "d"(3), "r"(r10), "r"(r8), "r"(r9)
-        : "rcx", "r11", "memory"
+        : "0"(9),               /* mmap */
+          "D"((void *)0),       /* addr   = NULL  (rdi) */
+          "S"(size),            /* length          (rsi) */
+          "d"(PROT_READ_WRITE), /* prot            (rdx) */
+          "r"(r10),             /* flags           (r10) */
+          "r"(r8),              /* fd              (r8)  */
+          "r"(r9)               /* offset          (r9)  */
+        : "memory", "rcx", "r11"
     );
     return ret;
 }
 
-void sc_page_free(void *ptr, usize size) {
-    usize sz = align_up(size, 4096);
+static long sc_munmap(void *ptr, usize size) {
+    long ret;
     __asm__ volatile (
         "syscall"
-        : : "a"(11), "D"(ptr), "S"(sz)
-        : "rcx", "r11", "memory"
+        : "=a"(ret)
+        : "0"(11),                 /* munmap */
+          "D"(ptr),
+          "S"(size)
+        : "memory", "rcx", "r11"
     );
+    return ret;
 }
-
-#else
-/* portable fallback — requires libc mmap but no other stdlib */
-#include <sys/mman.h>
-void *sc_page_alloc(usize size) {
-    usize sz = align_up(size, 4096);
-    return mmap(NULL, sz, PROT_READ|PROT_WRITE,
-                MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-}
-void sc_page_free(void *ptr, usize size) {
-    munmap(ptr, align_up(size, 4096));
-}
-#endif
 
 /* ============================================================
-   raw memory ops
+   PAGE ALLOCATOR (internal)
    ============================================================ */
-
-void sc_memset(void *dst, u8 val, usize n) {
-    u8 *d = (u8*)dst;
-    while (n--) *d++ = val;
+static void *page_alloc(usize size) {
+    usize aligned = (size + PAGE_SIZE - 1) & ~(usize)(PAGE_SIZE - 1);
+    void *p = sc_mmap(aligned);
+    return (p == MAP_FAILED_VAL) ? NULL : p;
 }
 
-void sc_memcpy(void *dst, const void *src, usize n) {
-    u8 *d       = (u8*)dst;
-    const u8 *s = (const u8*)src;
-    while (n--) *d++ = *s++;
+static void page_free(void *ptr, usize size) {
+    if (!ptr || size == 0) return;
+    usize aligned = (size + PAGE_SIZE - 1) & ~(usize)(PAGE_SIZE - 1);
+    sc_munmap(ptr, aligned);
 }
 
-void sc_memmove(void *dst, const void *src, usize n) {
-    u8 *d       = (u8*)dst;
-    const u8 *s = (const u8*)src;
-    if (d < s)       { while (n--) *d++ = *s++; }
-    else if (d > s)  { d += n; s += n; while (n--) *--d = *--s; }
+/* ============================================================
+   HELPERS  (no stdlib)
+   ============================================================ */
+static void sc_memset(void *dst, u8 val, usize n) {
+    u8 *p = (u8 *)dst;
+    while (n--) *p++ = val;
 }
 
-int sc_memcmp(const void *a, const void *b, usize n) {
-    const u8 *x = (const u8*)a, *y = (const u8*)b;
-    while (n--) {
-        if (*x != *y) return (int)*x - (int)*y;
-        x++; y++;
+/* ============================================================
+   ARENA
+   ============================================================ */
+#define HEADER_SIZE (sizeof(usize))
+
+static void  *arena_base = NULL;
+static usize  arena_pos  = 0;
+
+static void arena_init(void) {
+    if (arena_base) return;
+    arena_base = page_alloc(ARENA_CAP);
+    arena_pos  = 0;
+}
+
+/* ============================================================
+   LARGE ALLOCATION LIMIT
+   ============================================================ */
+static usize large_allocated = 0;
+static usize large_limit     = 1 * MB;
+
+void mem_limit(usize bytes) {
+    large_limit = bytes;
+}
+
+/* ============================================================
+   PUBLIC API
+   ============================================================ */
+void *malloc(usize size) {
+    if (size == 0) return NULL;
+
+    if (size > SMALL_ALLOC_LIMIT) {
+        usize total = size + HEADER_SIZE;
+        if (large_allocated + total > large_limit) return NULL;
+        void *raw = page_alloc(total);
+        if (!raw) return NULL;
+        *(usize *)raw = total;
+        large_allocated += total;
+        return (u8 *)raw + HEADER_SIZE;
     }
-    return 0;
+
+    arena_init();
+    if (!arena_base) return NULL;
+
+    usize p = align_up(arena_pos, 8);
+    usize total = HEADER_SIZE + size;
+    if (p + total > ARENA_CAP) return NULL;
+
+    *(usize *)((u8 *)arena_base + p) = 0;    /* 0 = arena-owned */
+    void *ptr = (u8 *)arena_base + p + HEADER_SIZE;
+    arena_pos = p + total;
+    return ptr;
 }
 
-/* ============================================================
-   arena
-   ============================================================ */
-
-void arena_init(Arena *a, void *buf, usize cap) {
-    a->buf = (u8*)buf;
-    a->cap = cap;
-    a->pos = 0;
+void *calloc(usize n, usize size) {
+    usize total = n * size;
+    void *ptr = malloc(total);
+    if (ptr) sc_memset(ptr, 0, total);
+    return ptr;
 }
 
-void *arena_alloc(Arena *a, usize size, usize alignment) {
-    usize cur = align_up(a->pos, alignment);
-    if (cur + size > a->cap) return NULL;
-    a->pos = cur + size;
-    return a->buf + cur;
+void free(void *ptr) {
+    if (!ptr) return;
+    usize *hdr = (usize *)((u8 *)ptr - HEADER_SIZE);
+    if (*hdr == 0) return;
+    large_allocated -= *hdr;
+    page_free(hdr, *hdr);
 }
 
-void arena_reset(Arena *a) {
-    a->pos = 0;
-}
-
-int arena_create(Arena *a, usize cap) {
-    void *mem = sc_page_alloc(cap);
-    if (!mem) return FALSE;
-    arena_init(a, mem, cap);
-    return TRUE;
-}
-
-void arena_destroy(Arena *a) {
-    if (a->buf) sc_page_free(a->buf, a->cap);
-    a->buf = NULL;
-    a->cap = 0;
-    a->pos = 0;
+void *realloc(void *ptr, usize size) {
+    if (!ptr) return malloc(size);
+    if (size == 0) { free(ptr); return NULL; }
+    void *new = malloc(size);
+    if (!new) return NULL;
+    usize *hdr = (usize *)((u8 *)ptr - HEADER_SIZE);
+    usize old_size = (*hdr == 0) ? SMALL_ALLOC_LIMIT : *hdr - HEADER_SIZE;
+    usize copy = size < old_size ? size : old_size;
+    u8 *s = (u8 *)ptr, *d = (u8 *)new;
+    while (copy--) *d++ = *s++;
+    free(ptr);
+    return new;
 }

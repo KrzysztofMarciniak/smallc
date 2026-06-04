@@ -1,7 +1,9 @@
-CC      ?= gcc
-CFLAGS  := -Wall -Wextra -Wpedantic -std=c11 -O2
-AR      := ar
-ARFLAGS := rcs
+CC      ?= tcc
+CFLAGS  ?= -Wall -Wextra -Wpedantic -std=c99 -O2
+PICFLAGS ?= -fPIC
+
+AR      ?= ar
+ARFLAGS ?= rcs
 
 PREFIX  ?= /usr/local
 LIBDIR  ?= $(PREFIX)/lib
@@ -16,7 +18,8 @@ SRC := \
 
 OBJ := $(SRC:.c=.o)
 
-TARGET := libsmallc.a
+TARGET_A  := libsmallc.a
+TARGET_SO := libsmallc.so
 
 HEADERS := \
 	hashmap/hashmap.h \
@@ -28,38 +31,38 @@ HEADERS := \
 
 .PHONY: all clean install uninstall
 
-all: $(TARGET)
+all: $(TARGET_A) $(TARGET_SO)
 
-$(TARGET): $(OBJ)
+$(TARGET_A): $(OBJ)
 	$(AR) $(ARFLAGS) $@ $^
+
+$(TARGET_SO): CFLAGS += $(PICFLAGS)
+$(TARGET_SO): $(OBJ)
+	$(CC) -shared -o $@ $^
 
 %.o: %.c
 	$(CC) $(CFLAGS) -I. -c $< -o $@
 
-install: $(TARGET)
+install: $(TARGET_A) $(TARGET_SO)
 	install -d $(DESTDIR)$(LIBDIR)
 	install -d $(DESTDIR)$(INCDIR)
 
-	install -m 644 $(TARGET) $(DESTDIR)$(LIBDIR)/
+	install -m 644 $(TARGET_A)  $(DESTDIR)$(LIBDIR)/
+	install -m 755 $(TARGET_SO) $(DESTDIR)$(LIBDIR)/
 
-	install -m 644 hashmap/hashmap.h $(DESTDIR)$(INCDIR)/
-	install -m 644 memory/memory.h  $(DESTDIR)$(INCDIR)/
-	install -m 644 print/print.h     $(DESTDIR)$(INCDIR)/
-	install -m 644 string/string.h   $(DESTDIR)$(INCDIR)/
-	install -m 644 types/types.h     $(DESTDIR)$(INCDIR)/
-	install -m 644 vector/vector.h   $(DESTDIR)$(INCDIR)/
+	for h in $(HEADERS); do \
+		install -m 644 $$h $(DESTDIR)$(INCDIR)/; \
+	done
 
 uninstall:
-	rm -f $(DESTDIR)$(LIBDIR)/$(TARGET)
+	rm -f $(DESTDIR)$(LIBDIR)/$(TARGET_A)
+	rm -f $(DESTDIR)$(LIBDIR)/$(TARGET_SO)
 
-	rm -f $(DESTDIR)$(INCDIR)/hashmap.h
-	rm -f $(DESTDIR)$(INCDIR)/memory.h
-	rm -f $(DESTDIR)$(INCDIR)/print.h
-	rm -f $(DESTDIR)$(INCDIR)/string.h
-	rm -f $(DESTDIR)$(INCDIR)/types.h
-	rm -f $(DESTDIR)$(INCDIR)/vector.h
+	for h in $(notdir $(HEADERS)); do \
+		rm -f $(DESTDIR)$(INCDIR)/$$h; \
+	done
 
 	rmdir --ignore-fail-on-non-empty $(DESTDIR)$(INCDIR)
 
 clean:
-	rm -f $(OBJ) $(TARGET)
+	rm -f $(OBJ) $(TARGET_A) $(TARGET_SO)
